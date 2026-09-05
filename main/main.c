@@ -28,97 +28,99 @@
  */
 #define LIS2DH12_ADDR   0x19
 
-/* INT1 del LIS2DH12 conectado aqui */
+/* INT1 del LIS2DH12 */
 #define INT1_GPIO       GPIO_NUM_3
 
 
 /* =========================================================
- * PARAMETROS DE DETECCION DE MOVIMIENTO
+ * PARAMETROS DE DETECCION
  *
- * MODIFICA PRINCIPALMENTE ESTA SECCION
+ * AJUSTA PRINCIPALMENTE ESTOS PARAMETROS
  * ========================================================= */
+
 
 /*
  * ODR = 10 Hz
- * X, Y, Z habilitados.
+ * X, Y, Z habilitados
  */
 #define MOTION_CTRL1            0x27
 
 
 /*
- * Umbral de aceleracion.
+ * HIGH-PASS FILTER PARA INT1
  *
- * Mayor valor = menos sensible.
+ * CTRL_REG2:
  *
- * En escala +-2 g:
- * aproximadamente 16 mg por paso.
+ * HPM  = 00   -> modo normal
+ * HPCF = 00   -> corte ~0.2 Hz con ODR 10 Hz
+ * HP_IA1 = 1  -> HPF aplicado a INT1
  *
- * Ejemplos:
- *
-0x3A → ~928 mg
-0x3B → ~944 mg
-0x3C → ~960 mg
-0x3D → ~976 mg
-0x3E → ~992 mg
-0x3F → ~1008 mg
-0x40 → ~1024 mg
+ * Resultado: 0x01
  */
-#define MOTION_THRESHOLD        0x3F
+#define MOTION_HPF              0x01
+
+
+/*
+ * Umbral de movimiento.
+ *
+ * En +-2 g:
+ * 1 paso ~= 16 mg
+ *
+ * 0x10 -> ~256 mg
+ * 0x18 -> ~384 mg
+ * 0x20 -> ~512 mg
+ * 0x28 -> ~640 mg
+ * 0x30 -> ~768 mg
+ *
+ * Con HPF ya no necesitas trabajar
+ * cerca de 1 g para evitar la gravedad.
+ */
+#define MOTION_THRESHOLD        0x20
 
 
 /*
  * Duracion minima.
  *
- * A ODR = 10 Hz:
- * cada unidad equivale aproximadamente
- * a una muestra (~100 ms).
+ * ODR = 10 Hz
  *
- * 0x00 -> inmediato
+ * 0x00 -> practicamente inmediato
  * 0x01 -> ~100 ms
- * 0x05 -> ~500 ms
- * 0x0A -> ~1 s
+ * 0x02 -> ~200 ms
+ * 0x03 -> ~300 ms
  */
 #define MOTION_DURATION         0x00
 
 
 /*
- * Condiciones que pueden generar INT1.
+ * X+, Y+, Z+
  *
- * 0x2A:
- * X positivo
- * Y positivo
- * Z positivo
- *
- * combinados mediante OR.
+ * OR:
+ * cualquiera de los 3 ejes
+ * puede generar INT1.
  */
 #define MOTION_INT1_CONFIG      0x2A
 
 
 /*
- * Mantiene INT1 activo hasta
- * leer INT1_SRC.
+ * Mantener INT1 activo
+ * hasta leer INT1_SRC.
  */
 #define MOTION_LATCH            0x08
 
 
 /*
- * Interrupcion activa LOW.
+ * INT1 activo LOW:
  *
- * Normal:
- * INT1 = HIGH
- *
- * Evento:
- * INT1 = LOW
+ * reposo      -> HIGH
+ * interrupcion -> LOW
  */
 #define MOTION_ACTIVE_LOW       0x02
 
 
 /*
- * Envia el generador IA1
- * al pin fisico INT1.
+ * Generador IA1 -> pin INT1
  */
 #define MOTION_ROUTE_INT1       0x40
-
 
 
 /* =========================================================
@@ -128,9 +130,13 @@
 #define REG_WHO_AM_I    0x0F
 
 #define REG_CTRL1       0x20
+#define REG_CTRL2       0x21
 #define REG_CTRL3       0x22
+#define REG_CTRL4       0x23
 #define REG_CTRL5       0x24
 #define REG_CTRL6       0x25
+
+#define REG_REFERENCE   0x26
 
 #define REG_INT1_CFG    0x30
 #define REG_INT1_SRC    0x31
@@ -220,7 +226,6 @@ static esp_err_t i2c_init(void)
 
         .glitch_ignore_cnt = 7,
 
-        /* Pull-ups internos */
         .flags.enable_internal_pullup = true,
     };
 
@@ -262,7 +267,7 @@ static esp_err_t i2c_init(void)
 
 
 /* =========================================================
- * CONFIGURAR GPIO INT1 DEL ESP32
+ * CONFIGURAR GPIO INT1 ESP32
  * ========================================================= */
 
 static esp_err_t int1_gpio_init(void)
@@ -282,11 +287,8 @@ static esp_err_t int1_gpio_init(void)
             GPIO_PULLDOWN_DISABLE,
 
         /*
-         * INT1:
-         *
-         * HIGH -> LOW
-         *
-         * cuando ocurre evento.
+         * INT1 normalmente HIGH
+         * y baja cuando ocurre evento.
          */
         .intr_type =
             GPIO_INTR_NEGEDGE
@@ -328,15 +330,32 @@ static esp_err_t int1_gpio_init(void)
 
 
 /* =========================================================
- * CONFIGURAR INTERRUPCION DEL LIS2DH12
+ * CONFIGURAR LIS2DH12
  * ========================================================= */
 
 static esp_err_t lis2dh12_config_int1(void)
 {
     esp_err_t ret;
+    uint8_t dummy;
 
 
-    /* Frecuencia de muestreo */
+    /*
+     * Desactivar temporalmente el generador
+     * mientras configuramos.
+     */
+    ret = write_reg(
+        REG_INT1_CFG,
+        0x00
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /* -----------------------------------------
+     * 10 Hz + XYZ
+     * ----------------------------------------- */
+
     ret = write_reg(
         REG_CTRL1,
         MOTION_CTRL1
@@ -346,7 +365,40 @@ static esp_err_t lis2dh12_config_int1(void)
         return ret;
 
 
-    /* Enviar IA1 al pin INT1 */
+    /* -----------------------------------------
+     * HIGH-PASS FILTER
+     *
+     * HP_IA1 = 1
+     * ----------------------------------------- */
+
+    ret = write_reg(
+        REG_CTRL2,
+        MOTION_HPF
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /* -----------------------------------------
+     * Escala +-2 g
+     *
+     * CTRL_REG4 = 0x00
+     * ----------------------------------------- */
+
+    ret = write_reg(
+        REG_CTRL4,
+        0x00
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /* -----------------------------------------
+     * IA1 -> INT1
+     * ----------------------------------------- */
+
     ret = write_reg(
         REG_CTRL3,
         MOTION_ROUTE_INT1
@@ -356,7 +408,10 @@ static esp_err_t lis2dh12_config_int1(void)
         return ret;
 
 
-    /* Activar latch */
+    /* -----------------------------------------
+     * Latch INT1
+     * ----------------------------------------- */
+
     ret = write_reg(
         REG_CTRL5,
         MOTION_LATCH
@@ -366,7 +421,10 @@ static esp_err_t lis2dh12_config_int1(void)
         return ret;
 
 
-    /* INT1 activo en LOW */
+    /* -----------------------------------------
+     * INT1 activo LOW
+     * ----------------------------------------- */
+
     ret = write_reg(
         REG_CTRL6,
         MOTION_ACTIVE_LOW
@@ -376,17 +434,10 @@ static esp_err_t lis2dh12_config_int1(void)
         return ret;
 
 
-    /* Ejes que generan interrupcion */
-    ret = write_reg(
-        REG_INT1_CFG,
-        MOTION_INT1_CONFIG
-    );
+    /* -----------------------------------------
+     * Umbral
+     * ----------------------------------------- */
 
-    if (ret != ESP_OK)
-        return ret;
-
-
-    /* Umbral de movimiento */
     ret = write_reg(
         REG_INT1_THS,
         MOTION_THRESHOLD
@@ -396,10 +447,75 @@ static esp_err_t lis2dh12_config_int1(void)
         return ret;
 
 
-    /* Duracion minima */
+    /* -----------------------------------------
+     * Duracion
+     * ----------------------------------------- */
+
     ret = write_reg(
         REG_INT1_DUR,
         MOTION_DURATION
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /*
+     * Esperar algunas muestras antes
+     * de inicializar la referencia HPF.
+     */
+    vTaskDelay(
+        pdMS_TO_TICKS(500)
+    );
+
+
+    /* -----------------------------------------
+     * REINICIAR REFERENCIA DEL HPF
+     *
+     * En HPM = 00, leer REFERENCE
+     * reinicia el filtro tomando el
+     * estado actual como referencia.
+     * ----------------------------------------- */
+
+    ret = read_reg(
+        REG_REFERENCE,
+        &dummy
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /*
+     * Esperar algunas muestras para
+     * estabilizar el filtro.
+     */
+    vTaskDelay(
+        pdMS_TO_TICKS(500)
+    );
+
+
+    /*
+     * Limpiar posible evento anterior.
+     */
+    ret = read_reg(
+        REG_INT1_SRC,
+        &dummy
+    );
+
+    if (ret != ESP_OK)
+        return ret;
+
+
+    /* -----------------------------------------
+     * ACTIVAR GENERADOR INT1 AL FINAL
+     *
+     * X+ OR Y+ OR Z+
+     * ----------------------------------------- */
+
+    ret = write_reg(
+        REG_INT1_CFG,
+        MOTION_INT1_CONFIG
     );
 
 
@@ -408,7 +524,7 @@ static esp_err_t lis2dh12_config_int1(void)
 
 
 /* =========================================================
- * MOSTRAR UN REGISTRO
+ * MOSTRAR REGISTRO
  * ========================================================= */
 
 static void print_reg(
@@ -459,7 +575,7 @@ static void print_configuration(void)
 
     ESP_LOGI(
         TAG,
-        "CONFIGURACION ACTUAL"
+        "CONFIGURACION LIS2DH12"
     );
 
     ESP_LOGI(
@@ -474,8 +590,18 @@ static void print_configuration(void)
     );
 
     print_reg(
+        "CTRL2",
+        REG_CTRL2
+    );
+
+    print_reg(
         "CTRL3",
         REG_CTRL3
+    );
+
+    print_reg(
+        "CTRL4",
+        REG_CTRL4
     );
 
     print_reg(
@@ -523,9 +649,9 @@ void app_main(void)
     uint8_t int1_src = 0;
 
 
-    /* -----------------------------------------------------
+    /* =====================================================
      * I2C
-     * ----------------------------------------------------- */
+     * ===================================================== */
 
     ESP_LOGI(
         TAG,
@@ -554,9 +680,9 @@ void app_main(void)
     );
 
 
-    /* -----------------------------------------------------
-     * IDENTIFICAR SENSOR
-     * ----------------------------------------------------- */
+    /* =====================================================
+     * WHO_AM_I
+     * ===================================================== */
 
     ret = read_reg(
         REG_WHO_AM_I,
@@ -599,9 +725,9 @@ void app_main(void)
     );
 
 
-    /* -----------------------------------------------------
+    /* =====================================================
      * GPIO INT1
-     * ----------------------------------------------------- */
+     * ===================================================== */
 
     ret = int1_gpio_init();
 
@@ -610,16 +736,22 @@ void app_main(void)
     {
         ESP_LOGE(
             TAG,
-            "Error configurando INT1 GPIO"
+            "Error GPIO INT1"
         );
 
         return;
     }
 
 
-    /* -----------------------------------------------------
+    /* =====================================================
      * CONFIGURAR SENSOR
-     * ----------------------------------------------------- */
+     * ===================================================== */
+
+    ESP_LOGI(
+        TAG,
+        "Configurando HPF..."
+    );
+
 
     ret = lis2dh12_config_int1();
 
@@ -628,7 +760,8 @@ void app_main(void)
     {
         ESP_LOGE(
             TAG,
-            "Error configurando LIS2DH12"
+            "Error configurando LIS2DH12: %s",
+            esp_err_to_name(ret)
         );
 
         return;
@@ -637,25 +770,25 @@ void app_main(void)
 
     ESP_LOGI(
         TAG,
-        "INT1 configurado"
+        "LIS2DH12 configurado"
     );
 
 
-    vTaskDelay(
-        pdMS_TO_TICKS(100)
-    );
-
-
-    /* -----------------------------------------------------
-     * VERIFICAR REGISTROS
-     * ----------------------------------------------------- */
+    /* =====================================================
+     * MOSTRAR REGISTROS
+     * ===================================================== */
 
     print_configuration();
 
 
     ESP_LOGI(
         TAG,
-        "INT1 normal = HIGH"
+        "HPF habilitado para INT1"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "INT1 reposo = HIGH"
     );
 
     ESP_LOGI(
@@ -664,9 +797,9 @@ void app_main(void)
     );
 
 
-    /* -----------------------------------------------------
+    /* =====================================================
      * LOOP
-     * ----------------------------------------------------- */
+     * ===================================================== */
 
     while (1)
     {
@@ -677,8 +810,7 @@ void app_main(void)
 
 
         /*
-         * ESP32 detecto flanco
-         * HIGH -> LOW
+         * ISR detecto HIGH -> LOW
          */
         if (int1_event)
         {
@@ -693,10 +825,10 @@ void app_main(void)
 
 
         /*
-         * Leer fuente de interrupcion.
+         * Leer fuente.
          *
-         * Esta lectura tambien limpia
-         * el latch de INT1.
+         * Al estar LATCH habilitado,
+         * esta lectura libera INT1.
          */
         ret = read_reg(
             REG_INT1_SRC,
